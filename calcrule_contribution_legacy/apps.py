@@ -3,8 +3,6 @@ import inspect
 from django.apps import AppConfig
 from calculation.apps import CALCULATION_RULES, read_all_calculation_rules
 
-from core.abs_calculation_rule import AbsStrategy
-
 
 MODULE_NAME = "calcrule_contribution_legacy"
 DEFAULT_CFG = {}

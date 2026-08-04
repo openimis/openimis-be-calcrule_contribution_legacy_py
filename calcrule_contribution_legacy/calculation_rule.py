@@ -1,7 +1,7 @@
 from django.contrib.contenttypes.models import ContentType
 from django.db.models.query import Q
 
-from calcrule_contribution_legacy.apps import AbsStrategy
+from core.abs_calculation_rule import AbsStrategy
 from calcrule_contribution_legacy.config import CLASS_RULE_PARAM_VALIDATION, \
     DESCRIPTION_CONTRIBUTION_VALUATION, FROM_TO
 from calcrule_contribution_legacy.converters import PolicyToInvoiceConverter, PolicyToLineItemConverter, \
