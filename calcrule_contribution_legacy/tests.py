@@ -276,3 +276,71 @@ class MutationTestContract(openIMISGraphQLTestCase):
 
         params_as_args = [f'{k}:{wrap_arg(v)}' for k, v in params.items()]
         return ", ".join(params_as_args)
+
+
+class LegacyRuleValidityAndMatchTest(TestCase):
+    """OP-3322: the `validity` context and check_calculation of the legacy rule."""
+
+    rule = ContributionPlanCalculationRuleProductModeling
+
+    @staticmethod
+    def _ccpd(contribution_plan, contract_details=None, date_valid_from=None):
+        from contract.models import ContractContributionPlanDetails
+        if contract_details is None:
+            contract_details = ContractDetails(
+                contract=Contract(date_valid_from=date_valid_from, date_approved=None)
+            )
+        return ContractContributionPlanDetails(
+            contribution_plan=contribution_plan, contract_details=contract_details
+        )
+
+    def _plan(self, code, **product_props):
+        product = create_test_product(code, custom_props={"insurance_period": 12, **product_props})
+        return create_test_contribution_plan(product=product, calculation=self.rule.uuid)
+
+    def _validity(self, plan, validity_from):
+        return self.rule.calculate(
+            self._ccpd(plan), context="validity", validity_from=validity_from
+        )
+
+    def test_check_calculation_matches_if_any_fk_matches(self):
+        # the contribution plan uses this rule, the bundle of the contract detail does
+        # not: the later FK (contract_details) must not overwrite the match
+        plan = self._plan("LGCY1")
+        empty_bundle = create_test_contribution_plan_bundle()
+        ccpd = self._ccpd(plan, contract_details=ContractDetails(contribution_plan_bundle=empty_bundle))
+        self.assertTrue(self.rule.check_calculation(ccpd))
+
+    def test_check_calculation_no_fk_matches(self):
+        product = create_test_product("LGCY2", custom_props={"insurance_period": 12})
+        other_plan = create_test_contribution_plan(product=product, calculation=str(uuid.uuid4()))
+        empty_bundle = create_test_contribution_plan_bundle()
+        ccpd = self._ccpd(other_plan, contract_details=ContractDetails(contribution_plan_bundle=empty_bundle))
+        self.assertFalse(self.rule.check_calculation(ccpd))
+
+    def test_validity_takes_the_first_cycle_after_the_reference_date(self):
+        plan = self._plan("LGCY3", start_cycle_1="01-04", start_cycle_2="01-07")
+        validity = self._validity(plan, datetime.datetime(2024, 2, 1))
+        self.assertEqual(validity["effective_date"], datetime.date(2024, 4, 1))
+        self.assertEqual(validity["expiry_date"], datetime.date(2025, 3, 31))
+
+    def test_validity_without_cycles_starts_at_the_reference_date(self):
+        plan = self._plan("LGCY4")
+        validity = self._validity(plan, datetime.datetime(2024, 3, 15))
+        self.assertEqual(validity["effective_date"], datetime.date(2024, 3, 15))
+        self.assertEqual(validity["expiry_date"], datetime.date(2025, 3, 14))
+
+    def test_validity_after_every_cycle_starts_next_year(self):
+        plan = self._plan("LGCY5", start_cycle_1="01-01", start_cycle_2="01-04")
+        validity = self._validity(plan, datetime.datetime(2024, 9, 1))
+        self.assertEqual(validity["effective_date"], datetime.date(2025, 1, 1))
+
+    def test_validity_defaults_to_the_contract_start(self):
+        plan = self._plan("LGCY6")
+        ccpd = self._ccpd(plan, date_valid_from=datetime.datetime(2024, 5, 1))
+        validity = self.rule.calculate(ccpd, context="validity")
+        self.assertEqual(validity["effective_date"], datetime.date(2024, 5, 1))
+
+    def test_validity_of_a_contract_has_no_single_product(self):
+        contract = Contract(date_valid_from=datetime.datetime(2024, 5, 1), date_approved=None)
+        self.assertIsNone(self.rule.calculate(contract, context="validity"))

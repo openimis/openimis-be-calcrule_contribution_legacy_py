@@ -19,6 +19,7 @@ from core.models import User
 from core.signals import register_service_signal, REGISTERED_SERVICE_SIGNALS
 from core import datetime
 from policy.models import Policy
+import datetime as py_datetime
 import json
 from uuid import UUID
 
@@ -81,9 +82,14 @@ class ContributionPlanCalculationRuleProductModeling(AbsStrategy):
                 f.name for f in instance.__class__._meta.fields
                 if f.get_internal_type() == 'ForeignKey' and f.remote_field.model.__name__ in list_class_name
             ]
+            # the rule applies when any related object uses it: a later FK must not
+            # overwrite an earlier match, and an empty (nullable) FK matches nothing
             for rf in related_fields:
-                match = cls.check_calculation(getattr(instance, rf))
-        
+                related = getattr(instance, rf, None)
+                if related is not None and cls.check_calculation(related):
+                    match = True
+                    break
+
         return match
 
     @staticmethod
@@ -101,6 +107,10 @@ class ContributionPlanCalculationRuleProductModeling(AbsStrategy):
     @classmethod
     def calculate(cls, instance, **kwargs):
         context = kwargs.get('context', None)
+        if context == 'validity':
+            # answered for any contract object (not only a contract contribution plan
+            # detail), and never falls through to the invoice conversion below
+            return cls._validity(instance, **kwargs)
         if instance.__class__.__name__ == "ContractContributionPlanDetails":
             if context == 'value':
                 # check type of json_ext - in case of string - json.loads
@@ -113,50 +123,97 @@ class ContributionPlanCalculationRuleProductModeling(AbsStrategy):
                 
             elif context == 'members':
                 return cls.get_members(instance.contract_details.insuree)
-            elif context == 'validity':
-                from core import datetime, datetimedelta
-                validity_from = kwargs.get('validity_from', None)
-                contract = None
-                if instance.__class__.__name__ == "Contract":
-                    contract = instance
-                elif instance.__class__.__name__ == "ContractContributionPlanDetails":
-                    contract = instance.contract_details.contract
-                if instance.__class__.__name__ == "ContractDetails":
-                    contract = instance.contract
-                if contract:
-                    validity_from = validity_from or contract.date_valid_from
-                    date_approved = contract.date_approved or validity_from
-                else:
-                    date_approved = validity_from
-                if not validity_from:
-                    return None
-                insurance_period = (
-                    datetimedelta(months=product.insurance_period)
-                    if product.insurance_period % 12 != 0
-                    else datetimedelta(years=product.insurance_period // 12)
-                )
-                for i in range(4):
-                    start = cycle_start(product, i, validity_from)
-                    if start:
-                        start_date = datetime.date.from_ad_date(start)
-                    
-                return {
-                    'enroll_date': date_approved,
-                    'start_date': date_approved,
-                    'effective_date': start_date,
-                    'expiry_date': (
-                        datetime.date.from_ad_date(start_date)
-                        + insurance_period
-                        - datetimedelta(days=1)
-                    ).to_ad_date()
-                }
-                
         else:
             user = kwargs.get('user', None)
             if user is None:
                 user = User.objects.filter(i_user__id=instance.audit_user_id).first()
             cls.run_convert(instance=instance, convert_to='Invoice', user=user)
         return f"conversion finished {cls.calculation_rule_name}"
+
+    @staticmethod
+    def _contract_of(instance):
+        class_name = instance.__class__.__name__
+        if class_name == "Contract":
+            return instance
+        if class_name == "ContractDetails":
+            return instance.contract
+        if class_name == "ContractContributionPlanDetails":
+            return instance.contract_details.contract
+        return None
+
+    @staticmethod
+    def _product_of(instance):
+        """
+        The product whose cycles and insurance period give the validity. Only a
+        contract contribution plan detail has a single product (its contribution
+        plan's benefit plan); a contract or a contract detail may cover several
+        contribution plans, so no single product can be derived from them.
+        """
+        if instance.__class__.__name__ == "ContractContributionPlanDetails":
+            contribution_plan = instance.contribution_plan
+            return contribution_plan.benefit_plan if contribution_plan else None
+        return None
+
+    @classmethod
+    def _validity(cls, instance, **kwargs):
+        """
+        The validity dates of `instance` for the `validity` context, or None when
+        they cannot be computed (no reference date or no product).
+
+        The effective date is the start of the first product cycle on or after the
+        reference date (validity_from, else the contract's date_valid_from). When every
+        cycle of that year has already started, it is the first cycle of the next
+        year; a product without cycles starts at the reference date itself (the same
+        fallbacks as policy.values.set_start_date).
+        """
+        from core import datetimedelta
+        validity_from = kwargs.get('validity_from', None)
+        contract = cls._contract_of(instance)
+        if contract:
+            validity_from = validity_from or contract.date_valid_from
+            date_approved = contract.date_approved or validity_from
+        else:
+            date_approved = validity_from
+        product = cls._product_of(instance)
+        if not validity_from or product is None:
+            return None
+        insurance_period = (
+            datetimedelta(months=product.insurance_period)
+            if product.insurance_period % 12 != 0
+            else datetimedelta(years=product.insurance_period // 12)
+        )
+        start_date = None
+        for i in range(4):
+            start = cycle_start(product, i, validity_from)
+            if start:
+                # the first cycle starting on or after the reference date wins
+                start_date = datetime.date.from_ad_date(start)
+                break
+        if start_date is None:
+            # every cycle of the reference year has started: the first cycle of the
+            # next year (as policy.values.set_start_date does)
+            cycles = [getattr(product, "start_cycle_%s" % (i + 1), None) for i in range(4)]
+            first_cycle = next((c for c in cycles if c), None)
+            if first_cycle:
+                start_date = datetime.date.from_ad_date(
+                    py_datetime.datetime.strptime(
+                        "%s-%s" % (first_cycle, validity_from.year + 1), "%d-%m-%Y"
+                    )
+                )
+        if start_date is None:
+            # a product without cycles: the coverage starts at the reference date
+            start_date = datetime.date.from_ad_date(validity_from)
+
+        return {
+            'enroll_date': date_approved,
+            'start_date': date_approved,
+            'effective_date': start_date,
+            'expiry_date': (
+                start_date
+                + insurance_period
+                - datetimedelta(days=1)
+            ).to_ad_date()
+        }
 
     @classmethod
     def get_linked_class(cls, sender, class_name, **kwargs):
